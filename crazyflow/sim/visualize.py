@@ -69,7 +69,6 @@ def draw_points(sim: Sim, points: NDArray, rgba: NDArray | None = None, size: fl
         )
 
 
-<<<<<<< HEAD
 def draw_trajectory(
     sim: Sim,
     waypoints: NDArray,
@@ -109,7 +108,6 @@ def draw_trajectory(
     )
     if show_waypoints:
         draw_points(sim, waypoints, rgba=waypoint_rgba, size=waypoint_size)
-=======
 def draw_capsule(
     sim: Sim,
     p1: NDArray,
@@ -139,7 +137,6 @@ def draw_capsule(
     geom_type = mujoco.mjtGeom.mjGEOM_CYLINDER if cylinder else mujoco.mjtGeom.mjGEOM_CAPSULE
     rgba = rgba if rgba is not None else np.array([1, 0, 0, 1.0])
     sim.viewer.viewer.add_marker(type=geom_type, pos=pos, size=size, mat=mat, rgba=rgba)
->>>>>>> baf2035cc583e5762bb5d9854da37815d7a52ac4
 
 
 def change_material(
