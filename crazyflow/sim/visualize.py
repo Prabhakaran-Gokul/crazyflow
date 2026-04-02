@@ -69,6 +69,47 @@ def draw_points(sim: Sim, points: NDArray, rgba: NDArray | None = None, size: fl
         )
 
 
+def draw_trajectory(
+    sim: Sim,
+    waypoints: NDArray,
+    line_rgba: NDArray | None = None,
+    waypoint_rgba: NDArray | None = None,
+    line_start_size: float = 2.0,
+    line_end_size: float = 2.0,
+    waypoint_size: float = 0.01,
+    show_waypoints: bool = True,
+):
+    """Draw a waypoint trajectory as a polyline (and optional waypoint markers).
+
+    Args:
+        sim: The simulation.
+        waypoints: Array of [N, 3] waypoints.
+        line_rgba: RGBA color for the polyline.
+        waypoint_rgba: RGBA color for waypoint markers.
+        line_start_size: Thickness at start of each line segment.
+        line_end_size: Thickness at end of each line segment.
+        waypoint_size: Sphere size for waypoint markers.
+        show_waypoints: Whether to draw sphere markers at waypoints.
+
+    Note:
+        This function has to be called every time before sim.render().
+    """
+    if waypoints.ndim != 2 or waypoints.shape[-1] != 3:
+        raise ValueError(f"waypoints must have shape [N, 3], got {waypoints.shape}")
+    if len(waypoints) < 2:
+        raise ValueError("waypoints must contain at least 2 points")
+
+    draw_line(
+        sim,
+        waypoints,
+        rgba=line_rgba,
+        start_size=line_start_size,
+        end_size=line_end_size,
+    )
+    if show_waypoints:
+        draw_points(sim, waypoints, rgba=waypoint_rgba, size=waypoint_size)
+
+
 def change_material(
     sim: Sim,
     mat_name: str,

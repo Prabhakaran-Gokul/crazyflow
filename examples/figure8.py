@@ -12,9 +12,10 @@ def main():
     # Create environment that contains a figure eight trajectory. You can parametrize the
     # observation space, i.e., which part of the trajectory is contained in the observation. Please
     # refer to the documentation of the environment for more information.
+    num_envs = 1
     envs = gymnasium.make_vec(
         "DroneFigureEightTrajectory-v0",
-        num_envs=20,
+        num_envs=num_envs,
         freq=50,
         n_samples=10,
         samples_dt=0.1,
@@ -27,7 +28,7 @@ def main():
     envs = JaxToNumpy(envs)
 
     # dummy action for going up (in attitude control)
-    action = np.zeros((20, 4), dtype=np.float32)
+    action = np.zeros((num_envs, 4), dtype=np.float32)
     action[..., 3] = 0.3
 
     obs, info = envs.reset()
