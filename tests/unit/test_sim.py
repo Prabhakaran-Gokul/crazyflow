@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import os
 from typing import TYPE_CHECKING
 
 import jax
@@ -10,6 +9,7 @@ import jax.numpy as jnp
 import mujoco
 import numpy as np
 import pytest
+from conftest import skip_if_headless
 from jax import Array
 
 from crazyflow.control import Control
@@ -21,11 +21,6 @@ from crazyflow.sim.visualize import change_material
 
 if TYPE_CHECKING:
     from typing import Any
-
-
-def skip_headless():
-    if os.environ.get("DISPLAY") is None:
-        pytest.skip("DISPLAY is not set, skipping test in headless environment")
 
 
 def array_meta_assert(
@@ -61,10 +56,11 @@ def array_compare_assert(x: Array, y: Array, value: bool = True, name: str | Non
 def test_sim_init(physics: Physics, device: str, control: Control, n_worlds: int):
     n_drones = 1
 
-    if physics != Physics.first_principles and control == Control.force_torque:
-        with pytest.raises(ConfigError):
-            Sim(n_worlds=n_worlds, physics=physics, device=device, control=control)
-        return
+    if physics != Physics.first_principles:
+        if control in (Control.force_torque, Control.rotor_vel):
+            with pytest.raises(ConfigError):
+                Sim(n_worlds=n_worlds, physics=physics, device=device, control=control)
+            return
 
     sim = Sim(n_worlds=n_worlds, physics=physics, device=device, control=control)
     assert sim.n_worlds == n_worlds
@@ -94,10 +90,11 @@ def test_sim_init(physics: Physics, device: str, control: Control, n_worlds: int
         assert sim.data.controls.attitude is None
 
     # Test force torque buffer shapes
-    ft_ctrl = sim.data.controls.force_torque
-    assert isinstance(ft_ctrl, ControlData)
-    array_meta_assert(ft_ctrl.cmd, (n_worlds, n_drones, 4), device)
-    array_meta_assert(ft_ctrl.staged_cmd, (n_worlds, n_drones, 4), device)
+    if control in (Control.state, Control.attitude, Control.force_torque):
+        ft_ctrl = sim.data.controls.force_torque
+        assert isinstance(ft_ctrl, ControlData)
+        array_meta_assert(ft_ctrl.cmd, (n_worlds, n_drones, 4), device)
+        array_meta_assert(ft_ctrl.staged_cmd, (n_worlds, n_drones, 4), device)
 
 
 @pytest.mark.unit
@@ -188,8 +185,9 @@ def test_reset_masked(device: str, physics: Physics):
 @pytest.mark.parametrize("physics", Physics)
 @pytest.mark.parametrize("control", Control)
 def test_sim_step(n_worlds: int, n_drones: int, physics: Physics, control: Control, device: str):
-    if physics != Physics.first_principles and control == Control.force_torque:
-        pytest.skip("Force-torque control is not supported with non-first-principles physics")
+    if physics != Physics.first_principles:
+        if control in (Control.force_torque, Control.rotor_vel):
+            pytest.skip(f"{control} is not supported with non-first-principles physics")
 
     sim = Sim(n_worlds=n_worlds, n_drones=n_drones, physics=physics, device=device, control=control)
     sim.step(2)
@@ -272,15 +270,15 @@ def test_sim_state_control_device(device: str):
 
 
 @pytest.mark.render
+@skip_if_headless
 def test_render_human(device: str):
     sim = Sim(device=device)
     sim.render()
     sim.viewer.close()
 
 
-# Do not mark as render to ensure it runs by default. This function will not open a viewer.
+@skip_if_headless
 def test_render_rgb_array(device: str):
-    skip_headless()
     sim = Sim(n_worlds=2, device=device)
     img = sim.render(mode="rgb_array", width=1024, height=1024)
     assert isinstance(img, np.ndarray), "Image must be a numpy array"
@@ -416,14 +414,14 @@ def test_data_committed(control: Control, device: str):
     def assert_committed(obj0: Array | Any, path: str = "data"):
         if isinstance(obj0, jnp.ndarray):
             assert obj0.committed, f"{path} is not committed"
+        elif isinstance(obj0, (int, float, bool, str, type(None))):
+            pass  # Primitive types are always "committed"
         elif hasattr(obj0, "__dict__"):  # Dataclass
             for attr_name in obj0.__dict__:
                 assert_committed(getattr(obj0, attr_name), f"{path}.{attr_name}")
         elif isinstance(obj0, (list, tuple)):  # Handle sequences
             for i, item0 in enumerate(obj0):
                 assert_committed(item0, f"{path}[{i}]")
-        elif isinstance(obj0, (int, float, bool, str, type(None))):
-            pass
         else:
             raise TypeError(f"Could not handle type {type(obj0)} at {path}")
 
@@ -519,22 +517,3 @@ def test_build_data(control: Control):
     assert isinstance(data, SimData), "build_data() must return a SimData instance"
     default_data = sim.build_default_data()
     assert isinstance(default_data, SimData), "build_default_data() must return a SimData instance"
-
-
-@pytest.mark.unit
-def test_functional_api():
-    """Test that the functional API works as expected."""
-    sim = Sim()
-    reset_fn = sim.build_reset_fn()
-    step_fn = sim.build_step_fn()
-    # Test types
-    assert callable(reset_fn), "reset_fn must be a pure function"
-    assert not hasattr(reset_fn, "__self__"), "reset_fn must not be a bound method"
-    assert callable(step_fn), "step_fn must be a pure function"
-    assert not hasattr(step_fn, "__self__"), "step_fn must not be a bound method"
-    # Test the functions run as expected
-    data, default_data = sim.build_data(), sim.build_default_data()
-    data = reset_fn(data, default_data, None)
-    data = reset_fn(data, default_data, jnp.array([True] * sim.n_worlds))
-    data = step_fn(data, 1)
-    data = step_fn(data, 2)

@@ -18,6 +18,7 @@ from einops import rearrange
 from gymnasium.envs.mujoco.mujoco_rendering import MujocoRenderer
 from jax import Array, Device
 
+import crazyflow.sim.functional as F
 from crazyflow.control.control import Control, controllable
 from crazyflow.exception import ConfigError, NotInitializedError
 from crazyflow.sim.data import SimControls, SimCore, SimData, SimParams, SimState, SimStateDeriv
@@ -29,7 +30,7 @@ from crazyflow.sim.physics import (
     so_rpy_rotor_drag_physics,
     so_rpy_rotor_physics,
 )
-from crazyflow.utils import grid_2d, leaf_replace, pytree_replace, to_device
+from crazyflow.utils import grid_2d, leaf_replace, pytree_replace
 
 if TYPE_CHECKING:
     from mujoco.mjx import Data, Model
@@ -76,8 +77,9 @@ class Sim:
     ):
         assert Physics(physics) in Physics, f"Physics mode {physics} not implemented"
         assert Control(control) in Control, f"Control mode {control} not implemented"
-        if physics != Physics.first_principles and control == Control.force_torque:
-            raise ConfigError("Force-torque control requires first principles physics")
+        if physics != Physics.first_principles:
+            if control in (Control.force_torque, Control.rotor_vel):
+                raise ConfigError(f"Control mode {control} requires first principles physics")
         if freq > 10_000 and not jax.config.jax_enable_x64:
             raise ConfigError("High frequency simulations require double precision mode")
         self.physics = physics
@@ -134,45 +136,19 @@ class Sim:
 
     def state_control(self, controls: Array):
         """Set the desired state for all drones in all worlds."""
-        assert controls.shape == (self.n_worlds, self.n_drones, 13), "controls shape mismatch"
-        assert self.control == Control.state, "State control is not enabled by the sim config"
-        controls = to_device(controls, self.device)
-        self.data = self.data.replace(
-            controls=self.data.controls.replace(
-                state=self.data.controls.state.replace(staged_cmd=controls)
-            )
-        )
+        self.data = F.state_control(self.data, controls)
 
     def attitude_control(self, controls: Array):
-        """Set the desired attitude for all drones in all worlds.
+        """Set the desired attitude for all drones in all worlds."""
+        self.data = F.attitude_control(self.data, controls)
 
-        We need to stage the attitude controls because the sys_id physics mode operates directly on
-        the attitude controls. If we were to directly update the controls, this would effectively
-        bypass the control frequency and run the attitude controller at the physics update rate. By
-        staging the controls, we ensure that the physics module sees the old controls until the
-        controller updates at its correct frequency.
-        """
-        assert controls.shape == (self.n_worlds, self.n_drones, 4), "controls shape mismatch"
-        assert self.control == Control.attitude, "Attitude control is not enabled by the sim config"
-        controls = to_device(controls, self.device)
-        self.data = self.data.replace(
-            controls=self.data.controls.replace(
-                attitude=self.data.controls.attitude.replace(staged_cmd=controls)
-            )
-        )
-
-    def force_torque_control(self, cmd: Array):
+    def force_torque_control(self, controls: Array):
         """Set the desired force and torque for all drones in all worlds."""
-        assert cmd.shape == (self.n_worlds, self.n_drones, 4), "Command shape mismatch"
-        assert self.control == Control.force_torque, (
-            "Force-torque control is not enabled by the sim config"
-        )
-        controls = to_device(cmd, self.device)
-        self.data = self.data.replace(
-            controls=self.data.controls.replace(
-                force_torque=self.data.controls.force_torque.replace(staged_cmd=controls)
-            )
-        )
+        self.data = F.force_torque_control(self.data, controls)
+
+    def rotor_vel_control(self, controls: Array):
+        """Set the desired rotor velocities for all drones in all worlds."""
+        self.data = F.rotor_vel_control(self.data, controls)
 
     @requires_mujoco_sync
     def render(
@@ -186,11 +162,11 @@ class Sim:
     ) -> NDArray | None:
         if self.viewer is None:
             if isinstance(camera, str):
-                cam_id, cam_name = None, camera
+                cam_id = mujoco.mj_name2id(self.mj_model, mujoco.mjtObj.mjOBJ_CAMERA, camera)
+                assert cam_id > -1, f"Camera name '{camera}' not found in the model."
             elif isinstance(camera, int):
-                cam_id, cam_name = camera, None
-                if cam_id < -1:
-                    raise ValueError(f"camera id must be >=-1, was {cam_id}")
+                cam_id = camera
+                assert cam_id >= -1, f"camera id must be >=-1, was {cam_id}"
             else:
                 raise TypeError("camera argument must be integer or string")
             self.mj_model.vis.global_.offwidth = width
@@ -203,8 +179,14 @@ class Sim:
                 height=height,
                 width=width,
                 camera_id=cam_id,
-                camera_name=cam_name,
             )
+            # In human mode, cam_id is set to -1, so we force it to the desired value
+            if mode == "human" and cam_id > -1:
+                # Render one frame to force mj to create the viewer
+                self.viewer.render(mode)
+                self.viewer.viewer.cam.fixedcamid = cam_id
+                self.viewer.viewer.cam.type = mujoco.mjtCamera.mjCAMERA_FIXED
+
         self.mj_data.qpos[:] = self.mjx_data.qpos[world, :]
         self.mj_data.mocap_pos[:] = self.mjx_data.mocap_pos[world, :]
         self.mj_data.mocap_quat[:] = self.mjx_data.mocap_quat[world, :]
@@ -232,11 +214,10 @@ class Sim:
         spec.copy_during_attach = True
         drone_spec = mujoco.MjSpec.from_file(str(self.drone_path))
         frame = spec.worldbody.add_frame(name="world")
+        if (drone_body := drone_spec.body("drone")) is None:
+            raise ValueError("Drone body not found in drone spec")
         # Add drones and their actuators
         for i in range(self.n_drones):
-            drone_body = drone_spec.body("drone")
-            if drone_body is None:
-                raise ValueError("Drone body not found in drone spec")
             drone = frame.attach_body(drone_body, "", f":{i}")
             drone.add_freejoint()
         return spec
@@ -327,11 +308,9 @@ class Sim:
             The simulation data as a single PyTree that can be passed to the pure simulation
             functions for stepping and resetting.
         """
-        state_freq = self.data.controls.state.freq if self.data.controls.state is not None else 0
-        attitude_freq = (
-            self.data.controls.attitude.freq if self.data.controls.attitude is not None else 0
-        )
-        force_torque_freq = self.data.controls.force_torque.freq
+        state_freq = 0 if (s := self.data.controls.state) is None else s.freq
+        attitude_freq = 0 if (a := self.data.controls.attitude) is None else a.freq
+        force_torque_freq = 0 if (ft := self.data.controls.force_torque) is None else ft.freq
         self.data = self.init_data(
             state_freq, attitude_freq, force_torque_freq, self.data.core.rng_key
         )
@@ -409,18 +388,7 @@ class Sim:
         as soon as the controller frequency allows for an update. Successive control updates that
         happen before the staged buffers are applied overwrite the desired values.
         """
-        controls = self.data.controls
-        match self.control:
-            case Control.state:
-                control_steps, control_freq = controls.state.steps, controls.state.freq
-            case Control.attitude:
-                control_steps, control_freq = controls.attitude.steps, controls.attitude.freq
-            case Control.force_torque:
-                control_steps = controls.force_torque.steps
-                control_freq = controls.force_torque.freq
-            case _:
-                raise NotImplementedError(f"Control mode {self.control} not implemented")
-        return controllable(self.data.core.steps, self.data.core.freq, control_steps, control_freq)
+        return F.controllable(self.data)
 
     @requires_mujoco_sync
     def contacts(self, body: str | None = None) -> Array:
@@ -471,6 +439,8 @@ def build_control_fns(
                 raise NotImplementedError(f"Control mode {control} not implemented for {physics}")
         case Control.force_torque:
             control_pipeline = (step_force_torque_controller,)
+        case Control.rotor_vel:
+            control_pipeline = ()
         case _:
             raise NotImplementedError(f"Control mode {control} not implemented")
 
@@ -534,6 +504,8 @@ def sync_sim2mjx(data: SimData, mjx_data: Data, mjx_model: Model) -> tuple[SimDa
     qvel = rearrange(jnp.concat([vel, ang_vel], axis=-1), "w d qvel -> w (d qvel)")
     mjx_data = mjx_data.replace(qpos=qpos, qvel=qvel)
     mjx_data = jax.vmap(mjx.kinematics, in_axes=(None, 0))(mjx_model, mjx_data)
+    # Required for rendering w. ray casting
+    mjx_data = jax.vmap(mjx.camlight, in_axes=(None, 0))(mjx_model, mjx_data)
     mjx_data = jax.vmap(mjx.collision, in_axes=(None, 0))(mjx_model, mjx_data)
     data = data.replace(core=data.core.replace(mjx_synced=True))
     return data, mjx_data
